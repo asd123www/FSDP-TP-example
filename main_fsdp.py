@@ -4,7 +4,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import ModuleList, Linear
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, BackwardPrefetch
 from torch.distributed.fsdp import BackwardPrefetch
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, size_based_auto_wrap_policy
+from torch.distributed.fsdp import fully_shard
 from transformers import LlamaForCausalLM, LlamaConfig, AutoModelForCausalLM, Gemma2Config, AutoConfig, Gemma2ForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaMLP, LlamaFlashAttention2, LlamaModel
 from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
@@ -21,6 +21,7 @@ import time
 import logging
 import functools
 from functools import partial
+from torch.distributed.tensor import DTensor
 import pprint
 from torch.distributed.device_mesh import DeviceMesh
 import accelerate
@@ -191,7 +192,7 @@ def print_size(state: object, bucket: dist.GradBucket) -> torch.futures.Future[t
 
 def initialize_model(model_name):
     # Create a Llama model
-    hf_token = "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"
+    hf_token = "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"
     config = AutoConfig.from_pretrained(
         model_name,
         token=hf_token,
@@ -223,33 +224,30 @@ def initialize_model(model_name):
 
     return model, config
 
-
-def fsdp_wrap_model(model, model_name):
-    if model_name == "meta-llama/Meta-Llama-3.1-405b":
-        auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=570000000)
-    # elif model_name == "intlsy/opt-175b-hyperparam":
-    #     auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=600000000)
+# fully_shard api.
+def fsdp_wrap_model(model, model_name, device_mesh):
+    if "opt" not in model_name:
+        layers = model.model.layers
     else:
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                type(model.model.layers[0]) if "opt" not in model_name else type(model.model.decoder.layers[0]),
-            },
-        )
-    device = torch.cuda.current_device()
-    model = FSDP(
-        model,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        auto_wrap_policy=auto_wrap_policy,
-        param_init_fn=lambda x: x.to_empty(device=device, recurse=False),
-        device_id=device,
-    )
+        layers = model.model.decoder.layers
+
+    # each transformer layer
+    for layer in layers:
+        fully_shard(layer, mesh=device_mesh)
+    if hasattr(model.model, 'embed_tokens'):
+        fully_shard(model.model.embed_tokens, mesh=device_mesh)
+    if hasattr(model, 'lm_head'):
+        fully_shard(model.lm_head, mesh=device_mesh)
+    fully_shard(model, mesh=device_mesh)
+
     if dist.get_rank() == 0:
+        print("Model wrapped with FSDP-v2 fully_shard")
         print(model)
     return model
 
 
 def tp_model(model, tp_mesh, tp_attn=False, tp_mlp=True):
+    """Apply tensor parallelism to the model using the provided TP mesh."""
     num_layers = len(model.model.layers)
     tp_plan = {}
     for i in range(num_layers):
@@ -279,7 +277,7 @@ def tp_model(model, tp_mesh, tp_attn=False, tp_mlp=True):
 
     model = parallelize_module(
         module=model,
-        device_mesh=device_mesh,
+        device_mesh=tp_mesh,
         parallelize_plan=tp_plan,
     )
     if dist.get_rank() == 0:
@@ -288,13 +286,31 @@ def tp_model(model, tp_mesh, tp_attn=False, tp_mlp=True):
     return model
 
 
-def run_model(model_name, batch_size, sequence_length, warmup_run, test_run, torch_profile):
+def run_model(model_name, batch_size, sequence_length, warmup_run, test_run, torch_profile, tp_size):
     device = torch.device("cuda", torch.cuda.current_device())
     model, config = initialize_model(model_name)
     model.train()
 
-    model = fsdp_wrap_model(model, model_name)
-    # model = tp_model(model, device_mesh)
+    # Create device mesh for parallelization strategies
+    world_size = dist.get_world_size()
+    if tp_size == 1:
+        # FSDP-only mode (original behavior)
+        fsdp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("fsdp",))
+        model = fsdp_wrap_model(model, model_name, fsdp_mesh)
+    else:
+        assert world_size % tp_size == 0
+        fsdp_size = world_size // tp_size
+        mesh_2d = init_device_mesh("cuda", (fsdp_size, tp_size), mesh_dim_names=("fsdp", "tp"))
+        tp_mesh = mesh_2d["tp"]
+        fsdp_mesh = mesh_2d["fsdp"]
+
+        model = tp_model(model, tp_mesh, tp_attn=False, tp_mlp=True)
+        model = fsdp_wrap_model(model, model_name, fsdp_mesh)
+
+    if rank == 0:
+        for name, param in model.named_parameters():
+            assert isinstance(param, DTensor)
+            print(f"{name}: {param._spec}")
 
     optimizer = AdamW(model.parameters(), lr=5e-5)
     # Dummy input
@@ -316,6 +332,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_run', type=int, default=0, help='Warmup iterations')
     parser.add_argument('--test_run', type=int, default=100, help='Test iterations')
     parser.add_argument('--torch_profile', type=int, default=0, help='Run torch profiler')
+    parser.add_argument('--tp_size', type=int, default=1, help='TP size for 2D mesh (default: FSDP-only)')
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -327,9 +344,6 @@ if __name__ == '__main__':
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend='nccl')
 
-    mesh_ranks = list(range(world_size))
-    device_mesh = DeviceMesh("cuda", mesh_ranks, mesh_dim_names=("tp",))
-
     print(f"rank {rank}: local_rank={local_rank}, local_world_size={local_world_size}", flush=True)
     print(f"rank {rank}: local_rank={local_rank}, local_world_size={local_world_size}, "
           f"world_size={world_size}\n", flush=True, end="")
@@ -338,7 +352,7 @@ if __name__ == '__main__':
 
     result = run_model(
         args.model_name, args.batch_size, args.sequence_length,
-        args.warmup_run, args.test_run, args.torch_profile)
+        args.warmup_run, args.test_run, args.torch_profile, args.tp_size)
 
     dist.barrier()
     print(f"rank {rank}: {result}\n", end="")
@@ -350,4 +364,4 @@ if __name__ == '__main__':
 # pip install accelerate
 # MAX_JOBS=64 python -m pip -v install flash-attn --no-build-isolation
 
-# torchrun --nproc_per_node=8 main_fsdp.py --torch_profile 1
+# torchrun --nproc_per_node=8 main_fsdp.py --torch_profile 1 --tp_size 1
