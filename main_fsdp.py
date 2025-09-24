@@ -191,7 +191,7 @@ def print_size(state: object, bucket: dist.GradBucket) -> torch.futures.Future[t
 
 def initialize_model(model_name):
     # Create a Llama model
-    hf_token = "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"
+    hf_token = "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"
     config = AutoConfig.from_pretrained(
         model_name,
         token=hf_token,
