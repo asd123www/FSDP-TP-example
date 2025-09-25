@@ -13,4 +13,4 @@ torchrun \
   --node_rank=$NODE_RANK \
   --master_addr=$MASTER_ADDR \
   --master_port=$MASTER_PORT \
-  main_fsdp.py --model_name meta-llama/Llama-2-70b-hf --sequence_length 1024
+  main_fsdp.py --model_name meta-llama/Llama-2-70b-hf --batch_size 2 --sequence_length 1024 --tp_size 4 --torch_profile 1

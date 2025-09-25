@@ -73,7 +73,7 @@ def get_param_size(module):
 
 
 def torch_profile_benchmark(model, optimizer, input_ids, warmup_run, test_run):
-    test_run = 3
+    test_run = 5
     rank = dist.get_rank()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -192,7 +192,7 @@ def print_size(state: object, bucket: dist.GradBucket) -> torch.futures.Future[t
 
 def initialize_model(model_name):
     # Create a Llama model
-    hf_token = "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"
+    hf_token = "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"
     config = AutoConfig.from_pretrained(
         model_name,
         token=hf_token,
@@ -224,6 +224,25 @@ def initialize_model(model_name):
 
     return model, config
 
+def set_modules_to_forward_prefetch(layers, num_to_forward_prefetch):
+    for i, layer in enumerate(layers):
+        if i >= len(layers) - num_to_forward_prefetch:
+            break
+        layers_to_prefetch = [
+            layers[i + j] for j in range(1, num_to_forward_prefetch + 1)
+        ]
+        layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+
+
+def set_modules_to_backward_prefetch(layers, num_to_backward_prefetch):
+    for i, layer in enumerate(layers):
+        if i < num_to_backward_prefetch:
+            continue
+        layers_to_prefetch = [
+            layers[i - j] for j in range(1, num_to_backward_prefetch + 1)
+        ]
+        layer.set_modules_to_backward_prefetch(layers_to_prefetch)
+
 # fully_shard api.
 def fsdp_wrap_model(model, model_name, device_mesh):
     if "opt" not in model_name:
@@ -239,6 +258,10 @@ def fsdp_wrap_model(model, model_name, device_mesh):
     if hasattr(model, 'lm_head'):
         fully_shard(model.lm_head, mesh=device_mesh)
     fully_shard(model, mesh=device_mesh)
+
+    # zezhou: apply prefetching.
+    set_modules_to_forward_prefetch(layers, num_to_forward_prefetch=2)
+    set_modules_to_backward_prefetch(layers, num_to_backward_prefetch=2)
 
     if dist.get_rank() == 0:
         print("Model wrapped with FSDP-v2 fully_shard")
@@ -329,8 +352,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='meta-llama/Llama-2-7b-hf', help='Name of the model')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--sequence_length', type=int, default=2048, help='Sequence length')
-    parser.add_argument('--warmup_run', type=int, default=0, help='Warmup iterations')
-    parser.add_argument('--test_run', type=int, default=100, help='Test iterations')
+    parser.add_argument('--warmup_run', type=int, default=5, help='Warmup iterations')
+    parser.add_argument('--test_run', type=int, default=50, help='Test iterations')
     parser.add_argument('--torch_profile', type=int, default=0, help='Run torch profiler')
     parser.add_argument('--tp_size', type=int, default=1, help='TP size for 2D mesh (default: FSDP-only)')
     args = parser.parse_args()
